@@ -1,4 +1,6 @@
 # requirements.txt
+jq
 requests
+beautifulsoup4
+lxml
 python-dateutil
-jq (for mk_download.sh usage on CI; install system package)
