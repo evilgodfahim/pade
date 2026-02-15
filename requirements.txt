@@ -1,0 +1,4 @@
+# requirements.txt
+requests
+python-dateutil
+jq (for mk_download.sh usage on CI; install system package)
