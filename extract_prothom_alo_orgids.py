@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
 Extract Prothom Alo e-paper article metadata via FlareSolverr.
-Includes precise timeout handling and debug timers to pinpoint bottlenecks.
+Fixed: Handles missing quotation marks in HTML and prevents timeout race conditions.
 """
 import os
 import sys
 import time
 import json
 import csv
+import re
 from datetime import datetime
 from typing import List, Dict, Optional
 
@@ -112,18 +113,29 @@ def make_mshare_link(orgid: str, eid: str, edate: str, sedId: str) -> str:
 
 def extract_meta_from_html(html: str) -> Dict[str, str]:
     soup = BeautifulSoup(html, "lxml")
-
     title = ""
-    og_title = soup.find("meta", property="og:title") or soup.find("meta", attrs={"name": "twitter:title"})
-    if og_title and og_title.get("content"):
-        title = og_title.get("content").strip()
-        if title.startswith("Common : "):
-            title = title.replace("Common : ", "", 1).strip()
-    elif soup.title and soup.title.string:
+
+    # 1. Targeted Regex to bypass BeautifulSoup and handle the missing quotation marks.
+    # It explicitly ignores the "Common :" part and captures exactly the headline text.
+    match = re.search(r'property="og:title"\s+content=(?:"?Common\s*:\s*)?(.*?)\s*/>', html, re.IGNORECASE)
+    if match:
+        title = match.group(1).strip()
+    
+    # 2. Fallback in case they fix their HTML or the Regex fails
+    if not title:
+        og_title = soup.find("meta", property="og:title") or soup.find("meta", attrs={"name": "twitter:title"})
+        if og_title and og_title.get("content"):
+            title = og_title.get("content").strip()
+            if title.startswith("Common :"):
+                title = title.replace("Common :", "", 1).strip()
+                
+    # 3. Final fallback to generic page title
+    if not title and soup.title and soup.title.string:
         title = soup.title.string.strip()
 
+    # Descriptions and images use quotes properly, so BeautifulSoup works fine here
     desc = ""
-    og_desc = soup.find("meta", property="og:description") or soup.find("meta", attrs={"name": "twitter:description"})
+    og_desc = soup.find("meta", property="og:description") or soup.find("meta", attrs={"name": "twitter:description"}) or soup.find("meta", itemprop="description")
     if og_desc and og_desc.get("content"):
         desc = og_desc.get("content").strip()
 
@@ -183,7 +195,8 @@ def run(edition: str, edition_date_override: Optional[str] = None):
                 content = {"title": "", "description": "", "image": ""}
             else:
                 content = extract_meta_from_html(rendered)
-                print(f"[DEBUG] Meta extracted -> Title: '{content['title'][:30]}...' | Image: {'Yes' if content['image'] else 'No'}")
+                # Print the first 40 characters of the extracted title to verify the Regex worked
+                print(f"[DEBUG] Meta extracted -> Title: '{content['title'][:40]}...' | Image: {'Yes' if content['image'] else 'No'}")
 
             article = {
                 "OrgId": orgid,
@@ -204,7 +217,6 @@ def run(edition: str, edition_date_override: Optional[str] = None):
             print(f"[DEBUG] Sleeping for {DELAY}s to prevent rate limiting...")
             time.sleep(DELAY)
 
-    # Output writing
     print("\n[INFO] Writing files to disk...")
     with open(json_path, "w", encoding="utf-8") as jf:
         json.dump(articles, jf, ensure_ascii=False, indent=2)
