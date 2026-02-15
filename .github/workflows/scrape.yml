@@ -33,11 +33,19 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run extractor (requires FLARESOLVERR_URL secret)
+      - name: Start FlareSolverr (Direct pull from GHCR)
+        run: |
+          # Pull and run FlareSolverr in the background
+          docker run -d -p 8191:8191 ghcr.io/flaresolverr/flaresolverr:latest
+          # Give it a few seconds to fully boot up
+          sleep 10
+
+      - name: Run extractor
         env:
           EDITION_ID: '1'
           EDITION_DATE: ${{ env.EDITION_DATE || '' }}
-          FLARESOLVERR_URL: ${{ secrets.FLARESOLVERR_URL }}
+          # Point directly to the local instance running on the runner
+          FLARESOLVERR_URL: 'http://127.0.0.1:8191'
           UEMAIL: '1169c825b8'
           SEDID: '1'
           DELAY: '0.5'
