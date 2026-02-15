@@ -3,6 +3,7 @@
 Extract Prothom Alo e-paper article metadata.
 Prioritizes Social Bot Spoofing for instant SSR extraction, falls back to FlareSolverr.
 Handles broken HTML (missing quotes) and duplicate generic meta tags.
+Outputs standard RSS 2.0 format for compatibility with feed readers.
 """
 import os
 import sys
@@ -11,6 +12,7 @@ import json
 import csv
 import re
 from datetime import datetime
+from email.utils import format_datetime
 from typing import List, Dict, Optional
 
 import requests
@@ -52,7 +54,7 @@ def fetch_meta_as_social_bot(url: str) -> Optional[str]:
         start = time.time()
         r = requests.get(url, headers=headers, timeout=10)
         elapsed = time.time() - start
-        
+
         if r.status_code == 200 and "og:title" in r.text:
             print(f"[DEBUG] <- Facebook Bot fetch successful in {elapsed:.2f}s!")
             return r.text
@@ -73,7 +75,7 @@ def fs_request_get(url: str, flaresolverr_url: str, fs_timeout: int = 15) -> Opt
         "maxTimeout": fs_timeout * 1000, 
         "render": True 
     }
-    
+
     print(f"[DEBUG] -> Sending to FlareSolverr Fallback: {url}")
     start_time = time.time()
     try:
@@ -85,10 +87,10 @@ def fs_request_get(url: str, flaresolverr_url: str, fs_timeout: int = 15) -> Opt
         elapsed = time.time() - start_time
         r.raise_for_status()
         data = r.json()
-        
+
         status = data.get("status", "unknown")
         print(f"[DEBUG] <- FlareSolverr returned '{status}' in {elapsed:.2f} seconds.")
-        
+
         if isinstance(data, dict):
             sol = data.get("solution")
             if isinstance(sol, dict) and "response" in sol:
@@ -130,13 +132,13 @@ def extract_meta_from_html(html: str) -> Dict[str, str]:
 
     # 1. Regex to find ALL og:titles, bypassing BeautifulSoup's broken parsing of unquoted attributes
     title_matches = re.findall(r'property="og:title"\s+content=(.*?)\s*/>', html, re.IGNORECASE)
-    
+
     if title_matches:
         # Grab the LAST match in the array (the specific article title, ignoring the top generic one)
         raw_title = title_matches[-1].strip()
         # Strip out "Common :" and any quotation marks
         title = re.sub(r'^"?Common\s*:\s*', '', raw_title, flags=re.IGNORECASE).strip('"\' ')
-    
+
     # 2. Final fallback
     if not title and soup.title and soup.title.string:
         title = soup.title.string.strip()
@@ -163,6 +165,9 @@ def run(edition: str, edition_date_override: Optional[str] = None):
         sys.exit(2)
 
     edate = today_str(edition_date_override)
+    # Generate an RFC-822 formatted date string for the RSS feed
+    rfc_pub_date = format_datetime(now_bd())
+    
     print(f"[INFO] Starting extraction for Edition: {edition}, Date: {edate}")
 
     pages = fetch_json(f"{BASE}/Home/GetAllpages", params={"editionid": edition, "editiondate": edate})
@@ -186,7 +191,7 @@ def run(edition: str, edition_date_override: Optional[str] = None):
 
         print(f"\n[INFO] --- Scanning Page {page_no} (ID: {page_id}) ---")
         stories = fetch_json(f"{BASE}/Home/getStoriesOnPage", params={"pageid": page_id}) or []
-        
+
         for s in stories:
             orgid = s.get("OrgId")
             storyid = s.get("storyid")
@@ -199,10 +204,10 @@ def run(edition: str, edition_date_override: Optional[str] = None):
 
             # --- HYBRID FETCH LOGIC ---
             rendered = fetch_meta_as_social_bot(mshare)
-            
+
             if not rendered:
                 rendered = fs_request_get(mshare, flaresolverr_url, fs_timeout=15)
-            
+
             if not rendered:
                 print(f"[WARNING] Content missing for OrgId={orgid}. Saving empty metadata.")
                 content = {"title": "", "description": "", "image": ""}
@@ -225,7 +230,7 @@ def run(edition: str, edition_date_override: Optional[str] = None):
                 "MIndexBase": mindex
             }
             articles.append(article)
-            
+
             print(f"[DEBUG] Sleeping for {DELAY}s...")
             time.sleep(DELAY)
 
@@ -244,18 +249,39 @@ def run(edition: str, edition_date_override: Optional[str] = None):
     else:
         open(csv_path, "w").close()
 
+    # --- Write as standard RSS 2.0 ---
     with open(xml_path, "w", encoding="utf-8") as xf:
         xf.write('<?xml version="1.0" encoding="utf-8"?>\n')
-        xf.write(f'<Epaper date="{edate}">\n')
+        xf.write('<rss version="2.0">\n')
+        xf.write('  <channel>\n')
+        xf.write(f'    <title>Prothom Alo E-paper ({edate})</title>\n')
+        xf.write(f'    <link>{BASE}</link>\n')
+        xf.write('    <description>Extracted articles from Prothom Alo E-paper</description>\n')
+        xf.write(f'    <pubDate>{rfc_pub_date}</pubDate>\n')
+        
         for a in articles:
-            xf.write("  <Article>\n")
-            for k, v in a.items():
-                if v is None:
-                    v = ""
-                safe = str(v).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-                xf.write(f"    <{k}>{safe}</{k}>\n")
-            xf.write("  </Article>\n")
-        xf.write("</Epaper>\n")
+            # Escape XML special characters safely
+            title_safe = str(a.get("Headline") or f"Article {a.get('OrgId')}").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            link_safe = str(a.get("Link") or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            guid_safe = str(a.get("OrgId") or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            
+            img_url = a.get("ImageUrl") or ""
+            desc_text = a.get("Description") or ""
+            
+            # Combine image and description safely inside CDATA
+            desc_html = f'<img src="{img_url}" /><br/><br/>' if img_url else ""
+            desc_html += desc_text
+            
+            xf.write("    <item>\n")
+            xf.write(f"      <title>{title_safe}</title>\n")
+            xf.write(f"      <link>{link_safe}</link>\n")
+            xf.write(f"      <guid isPermaLink=\"false\">{guid_safe}</guid>\n")
+            xf.write(f"      <pubDate>{rfc_pub_date}</pubDate>\n")
+            xf.write(f"      <description><![CDATA[{desc_html}]]></description>\n")
+            xf.write("    </item>\n")
+            
+        xf.write("  </channel>\n")
+        xf.write("</rss>\n")
 
     print(f"[SUCCESS] Total articles extracted: {len(articles)}")
     print(f"[SUCCESS] Outputs saved to: {OUT_DIR}/")
