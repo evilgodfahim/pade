@@ -2,7 +2,7 @@
 """
 Extract Prothom Alo e-paper article metadata.
 Prioritizes Social Bot Spoofing for instant SSR extraction, falls back to FlareSolverr.
-Handles broken HTML (missing quotes) via Regex.
+Handles broken HTML (missing quotes) and duplicate generic meta tags.
 """
 import os
 import sys
@@ -53,7 +53,6 @@ def fetch_meta_as_social_bot(url: str) -> Optional[str]:
         r = requests.get(url, headers=headers, timeout=10)
         elapsed = time.time() - start
         
-        # Check if it succeeded AND actually contains the meta tags we want
         if r.status_code == 200 and "og:title" in r.text:
             print(f"[DEBUG] <- Facebook Bot fetch successful in {elapsed:.2f}s!")
             return r.text
@@ -129,32 +128,30 @@ def extract_meta_from_html(html: str) -> Dict[str, str]:
     soup = BeautifulSoup(html, "lxml")
     title = ""
 
-    # 1. Regex to bypass BeautifulSoup and handle the missing quotation marks.
-    match = re.search(r'property="og:title"\s+content=(?:"?Common\s*:\s*)?(.*?)\s*/>', html, re.IGNORECASE)
-    if match:
-        title = match.group(1).strip()
+    # 1. Regex to find ALL og:titles, bypassing BeautifulSoup's broken parsing of unquoted attributes
+    title_matches = re.findall(r'property="og:title"\s+content=(.*?)\s*/>', html, re.IGNORECASE)
     
-    # 2. Fallback
-    if not title:
-        og_title = soup.find("meta", property="og:title") or soup.find("meta", attrs={"name": "twitter:title"})
-        if og_title and og_title.get("content"):
-            title = og_title.get("content").strip()
-            if title.startswith("Common :"):
-                title = title.replace("Common :", "", 1).strip()
-                
-    # 3. Final fallback
+    if title_matches:
+        # Grab the LAST match in the array (the specific article title, ignoring the top generic one)
+        raw_title = title_matches[-1].strip()
+        # Strip out "Common :" and any quotation marks
+        title = re.sub(r'^"?Common\s*:\s*', '', raw_title, flags=re.IGNORECASE).strip('"\' ')
+    
+    # 2. Final fallback
     if not title and soup.title and soup.title.string:
         title = soup.title.string.strip()
 
+    # Find ALL descriptions and take the last one
     desc = ""
-    og_desc = soup.find("meta", property="og:description") or soup.find("meta", attrs={"name": "twitter:description"}) or soup.find("meta", itemprop="description")
-    if og_desc and og_desc.get("content"):
-        desc = og_desc.get("content").strip()
+    og_descs = soup.find_all("meta", property="og:description") or soup.find_all("meta", attrs={"name": "twitter:description"})
+    if og_descs and og_descs[-1].get("content"):
+        desc = og_descs[-1].get("content").strip()
 
+    # Find ALL images and take the last one
     image = ""
-    og_img = soup.find("meta", property="og:image") or soup.find("meta", attrs={"name": "twitter:image"}) or soup.find("meta", itemprop="image")
-    if og_img and og_img.get("content"):
-        image = og_img.get("content").strip()
+    og_imgs = soup.find_all("meta", property="og:image") or soup.find_all("meta", attrs={"name": "twitter:image"})
+    if og_imgs and og_imgs[-1].get("content"):
+        image = og_imgs[-1].get("content").strip()
 
     return {"title": title, "description": desc, "image": image}
 
@@ -200,17 +197,14 @@ def run(edition: str, edition_date_override: Optional[str] = None):
             mshare = make_mshare_link(orgid, edition, edate, SEDID)
             mindex = make_mindex_link(edition, edate, SEDID, page_id, UEMAIL)
 
-            # --- THE NEW HYBRID FETCH LOGIC ---
-            # Step 1: Try lightning-fast social bot spoofing
+            # --- HYBRID FETCH LOGIC ---
             rendered = fetch_meta_as_social_bot(mshare)
             
-            # Step 2: If the bot fails, fallback to FlareSolverr
             if not rendered:
                 rendered = fs_request_get(mshare, flaresolverr_url, fs_timeout=15)
             
-            # Extract
             if not rendered:
-                print(f"[WARNING] Content completely missing for OrgId={orgid}. Saving empty metadata.")
+                print(f"[WARNING] Content missing for OrgId={orgid}. Saving empty metadata.")
                 content = {"title": "", "description": "", "image": ""}
             else:
                 content = extract_meta_from_html(rendered)
