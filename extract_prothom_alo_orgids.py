@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Extract Prothom Alo e-paper article metadata via FlareSolverr.
-Fixed: Handles missing quotation marks in HTML and prevents timeout race conditions.
+Extract Prothom Alo e-paper article metadata.
+Prioritizes Social Bot Spoofing for instant SSR extraction, falls back to FlareSolverr.
+Handles broken HTML (missing quotes) via Regex.
 """
 import os
 import sys
@@ -40,11 +41,32 @@ def today_str(override: Optional[str]) -> str:
     return override if override else now_bd().strftime("%d/%m/%Y")
 
 
+def fetch_meta_as_social_bot(url: str) -> Optional[str]:
+    """Pretend to be Facebook to get raw SSR meta tags instantly and bypass JS execution."""
+    headers = {
+        "User-Agent": "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
+        "Accept": "text/html"
+    }
+    print(f"[DEBUG] -> Spoofing Facebook Bot for: {url}")
+    try:
+        start = time.time()
+        r = requests.get(url, headers=headers, timeout=10)
+        elapsed = time.time() - start
+        
+        # Check if it succeeded AND actually contains the meta tags we want
+        if r.status_code == 200 and "og:title" in r.text:
+            print(f"[DEBUG] <- Facebook Bot fetch successful in {elapsed:.2f}s!")
+            return r.text
+        else:
+            print(f"[DEBUG] <- Facebook Bot missed the tags or got blocked (Status: {r.status_code}).")
+            return None
+    except Exception as e:
+        print(f"[DEBUG] <- Facebook Bot fetch error: {e}")
+        return None
+
+
 def fs_request_get(url: str, flaresolverr_url: str, fs_timeout: int = 15) -> Optional[str]:
-    """
-    fs_timeout (15s): Tells FlareSolverr to give up waiting for background ads quickly.
-    python_timeout (fs_timeout + 20s): Ensures Python waits patiently while FS packages the response.
-    """
+    """FlareSolverr fallback if the Social Bot fails."""
     python_timeout = fs_timeout + 20
     payload = {
         "cmd": "request.get",
@@ -53,9 +75,7 @@ def fs_request_get(url: str, flaresolverr_url: str, fs_timeout: int = 15) -> Opt
         "render": True 
     }
     
-    print(f"[DEBUG] -> Sending to FlareSolverr: {url}")
-    print(f"[DEBUG]    FS Max Timeout: {fs_timeout}s | Python Socket Timeout: {python_timeout}s")
-    
+    print(f"[DEBUG] -> Sending to FlareSolverr Fallback: {url}")
     start_time = time.time()
     try:
         r = requests.post(
@@ -64,7 +84,6 @@ def fs_request_get(url: str, flaresolverr_url: str, fs_timeout: int = 15) -> Opt
             timeout=python_timeout
         )
         elapsed = time.time() - start_time
-        
         r.raise_for_status()
         data = r.json()
         
@@ -78,11 +97,6 @@ def fs_request_get(url: str, flaresolverr_url: str, fs_timeout: int = 15) -> Opt
             if "response" in data:
                 return data["response"]
         return None
-
-    except requests.exceptions.ReadTimeout:
-        elapsed = time.time() - start_time
-        print(f"[ERROR] <- Python socket timed out after {elapsed:.2f}s. FlareSolverr took too long to build the response for {url}", file=sys.stderr)
-        return None
     except Exception as e:
         elapsed = time.time() - start_time
         print(f"[ERROR] <- FlareSolverr fetch failed after {elapsed:.2f}s for {url}: {e}", file=sys.stderr)
@@ -95,7 +109,7 @@ def fetch_json(url: str, params: dict = None, timeout: int = 15) -> Optional[dic
         r.raise_for_status()
         return r.json()
     except Exception as e:
-        print(f"[ERROR] Failed JSON fetch {url} params={params}: {e}", file=sys.stderr)
+        print(f"[ERROR] Failed JSON fetch {url}: {e}", file=sys.stderr)
         return None
 
 
@@ -115,13 +129,12 @@ def extract_meta_from_html(html: str) -> Dict[str, str]:
     soup = BeautifulSoup(html, "lxml")
     title = ""
 
-    # 1. Targeted Regex to bypass BeautifulSoup and handle the missing quotation marks.
-    # It explicitly ignores the "Common :" part and captures exactly the headline text.
+    # 1. Regex to bypass BeautifulSoup and handle the missing quotation marks.
     match = re.search(r'property="og:title"\s+content=(?:"?Common\s*:\s*)?(.*?)\s*/>', html, re.IGNORECASE)
     if match:
         title = match.group(1).strip()
     
-    # 2. Fallback in case they fix their HTML or the Regex fails
+    # 2. Fallback
     if not title:
         og_title = soup.find("meta", property="og:title") or soup.find("meta", attrs={"name": "twitter:title"})
         if og_title and og_title.get("content"):
@@ -129,11 +142,10 @@ def extract_meta_from_html(html: str) -> Dict[str, str]:
             if title.startswith("Common :"):
                 title = title.replace("Common :", "", 1).strip()
                 
-    # 3. Final fallback to generic page title
+    # 3. Final fallback
     if not title and soup.title and soup.title.string:
         title = soup.title.string.strip()
 
-    # Descriptions and images use quotes properly, so BeautifulSoup works fine here
     desc = ""
     og_desc = soup.find("meta", property="og:description") or soup.find("meta", attrs={"name": "twitter:description"}) or soup.find("meta", itemprop="description")
     if og_desc and og_desc.get("content"):
@@ -188,14 +200,20 @@ def run(edition: str, edition_date_override: Optional[str] = None):
             mshare = make_mshare_link(orgid, edition, edate, SEDID)
             mindex = make_mindex_link(edition, edate, SEDID, page_id, UEMAIL)
 
-            rendered = fs_request_get(mshare, flaresolverr_url, fs_timeout=15)
+            # --- THE NEW HYBRID FETCH LOGIC ---
+            # Step 1: Try lightning-fast social bot spoofing
+            rendered = fetch_meta_as_social_bot(mshare)
             
+            # Step 2: If the bot fails, fallback to FlareSolverr
             if not rendered:
-                print(f"[WARNING] Content missing for OrgId={orgid}. Saving empty metadata.")
+                rendered = fs_request_get(mshare, flaresolverr_url, fs_timeout=15)
+            
+            # Extract
+            if not rendered:
+                print(f"[WARNING] Content completely missing for OrgId={orgid}. Saving empty metadata.")
                 content = {"title": "", "description": "", "image": ""}
             else:
                 content = extract_meta_from_html(rendered)
-                # Print the first 40 characters of the extracted title to verify the Regex worked
                 print(f"[DEBUG] Meta extracted -> Title: '{content['title'][:40]}...' | Image: {'Yes' if content['image'] else 'No'}")
 
             article = {
@@ -214,7 +232,7 @@ def run(edition: str, edition_date_override: Optional[str] = None):
             }
             articles.append(article)
             
-            print(f"[DEBUG] Sleeping for {DELAY}s to prevent rate limiting...")
+            print(f"[DEBUG] Sleeping for {DELAY}s...")
             time.sleep(DELAY)
 
     print("\n[INFO] Writing files to disk...")
