@@ -6,6 +6,7 @@ Handles broken HTML (missing quotes) and duplicate generic meta tags.
 Outputs standard RSS 2.0 format for compatibility with feed readers.
 If more than 100 articles are extracted they overflow into additional XML files:
   output/articles.xml, output/articles_2.xml, output/articles_3.xml, ...
+Articles whose Description contains the phrase "পৃষ্ঠার পর" are excluded from XML output.
 """
 import os
 import sys
@@ -34,6 +35,7 @@ DELAY = float(os.getenv("DELAY", "0.5"))
 OUT_DIR = "output"
 BD_TZ = "Asia/Dhaka"
 XML_CHUNK_SIZE = 100  # max articles per xml file
+EXCLUDE_PHRASE = "পৃষ্ঠার পর"  # phrase to exclude from XML
 
 def now_bd() -> datetime:
     if ZoneInfo:
@@ -273,21 +275,34 @@ def run(edition: str, edition_date_override: Optional[str] = None):
     else:
         open(csv_path, "w").close()
 
+    # --- Filter articles for XML (exclude those whose description contains EXCLUDE_PHRASE) ---
+    xml_articles = []
+    for a in articles:
+        desc = (a.get("Description") or "")
+        if EXCLUDE_PHRASE in desc:
+            # article excluded from XML, but retained in JSON/CSV
+            continue
+        xml_articles.append(a)
+
+    excluded_count = len(articles) - len(xml_articles)
+    if excluded_count:
+        print(f"[INFO] Excluding {excluded_count} article(s) from XML because Description contains '{EXCLUDE_PHRASE}'.")
+
     # --- Write as standard RSS 2.0 with chunking if necessary ---
-    total = len(articles)
-    if total == 0:
+    total_xml = len(xml_articles)
+    if total_xml == 0:
         # create an empty xml file
         _write_rss_chunk([], edate, rfc_pub_date, xml_base_path, 1)
-        print(f"[SUCCESS] Total articles extracted: {total}")
+        print(f"[SUCCESS] Total articles extracted: {len(articles)} (XML contains 0 items after exclusions)")
         print(f"[SUCCESS] Outputs saved to: {OUT_DIR}/")
         return
 
     # Determine number of files needed
-    num_files = (total + XML_CHUNK_SIZE - 1) // XML_CHUNK_SIZE
+    num_files = (total_xml + XML_CHUNK_SIZE - 1) // XML_CHUNK_SIZE
     for idx in range(num_files):
         start = idx * XML_CHUNK_SIZE
         end = start + XML_CHUNK_SIZE
-        chunk = articles[start:end]
+        chunk = xml_articles[start:end]
         if idx == 0:
             out_path = xml_base_path
         else:
@@ -295,7 +310,7 @@ def run(edition: str, edition_date_override: Optional[str] = None):
         print(f"[INFO] Writing XML file {idx+1}/{num_files}: {os.path.basename(out_path)} ({len(chunk)} items)")
         _write_rss_chunk(chunk, edate, rfc_pub_date, out_path, idx+1)
 
-    print(f"[SUCCESS] Total articles extracted: {total}")
+    print(f"[SUCCESS] Total articles extracted: {len(articles)} (XML contains {total_xml} items after exclusions)")
     print(f"[SUCCESS] Outputs saved to: {OUT_DIR}/")
 
 if __name__ == "__main__":
