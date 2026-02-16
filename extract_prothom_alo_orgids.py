@@ -4,6 +4,8 @@ Extract Prothom Alo e-paper article metadata.
 Prioritizes Social Bot Spoofing for instant SSR extraction, falls back to FlareSolverr.
 Handles broken HTML (missing quotes) and duplicate generic meta tags.
 Outputs standard RSS 2.0 format for compatibility with feed readers.
+If more than 100 articles are extracted they overflow into additional XML files:
+  output/articles.xml, output/articles_2.xml, output/articles_3.xml, ...
 """
 import os
 import sys
@@ -31,17 +33,15 @@ UEMAIL = os.getenv("UEMAIL", "1169c825b8")
 DELAY = float(os.getenv("DELAY", "0.5"))
 OUT_DIR = "output"
 BD_TZ = "Asia/Dhaka"
-
+XML_CHUNK_SIZE = 100  # max articles per xml file
 
 def now_bd() -> datetime:
     if ZoneInfo:
         return datetime.now(ZoneInfo(BD_TZ))
     return datetime.now()
 
-
 def today_str(override: Optional[str]) -> str:
     return override if override else now_bd().strftime("%d/%m/%Y")
-
 
 def fetch_meta_as_social_bot(url: str) -> Optional[str]:
     """Pretend to be Facebook to get raw SSR meta tags instantly and bypass JS execution."""
@@ -65,23 +65,22 @@ def fetch_meta_as_social_bot(url: str) -> Optional[str]:
         print(f"[DEBUG] <- Facebook Bot fetch error: {e}")
         return None
 
-
 def fs_request_get(url: str, flaresolverr_url: str, fs_timeout: int = 15) -> Optional[str]:
     """FlareSolverr fallback if the Social Bot fails."""
     python_timeout = fs_timeout + 20
     payload = {
         "cmd": "request.get",
         "url": url,
-        "maxTimeout": fs_timeout * 1000, 
-        "render": True 
+        "maxTimeout": fs_timeout * 1000,
+        "render": True
     }
 
     print(f"[DEBUG] -> Sending to FlareSolverr Fallback: {url}")
     start_time = time.time()
     try:
         r = requests.post(
-            f"{flaresolverr_url.rstrip('/')}/v1", 
-            json=payload, 
+            f"{flaresolverr_url.rstrip('/')}/v1",
+            json=payload,
             timeout=python_timeout
         )
         elapsed = time.time() - start_time
@@ -103,7 +102,6 @@ def fs_request_get(url: str, flaresolverr_url: str, fs_timeout: int = 15) -> Opt
         print(f"[ERROR] <- FlareSolverr fetch failed after {elapsed:.2f}s for {url}: {e}", file=sys.stderr)
         return None
 
-
 def fetch_json(url: str, params: dict = None, timeout: int = 15) -> Optional[dict]:
     try:
         r = requests.get(url, params=params, timeout=timeout)
@@ -113,7 +111,6 @@ def fetch_json(url: str, params: dict = None, timeout: int = 15) -> Optional[dic
         print(f"[ERROR] Failed JSON fetch {url}: {e}", file=sys.stderr)
         return None
 
-
 def make_mindex_link(eid: str, edate: str, sedId: str, pgid: int, uemail: str) -> str:
     return (
         f"{BASE}/Home/MIndex?eid={eid}&edate={edate}&sedId={sedId}&pgid={pgid}"
@@ -121,10 +118,8 @@ def make_mindex_link(eid: str, edate: str, sedId: str, pgid: int, uemail: str) -
         f"&isIssueRefresh=False&uemail={uemail}"
     )
 
-
 def make_mshare_link(orgid: str, eid: str, edate: str, sedId: str) -> str:
     return f"{BASE}/Home/MShareArticle?OrgId={orgid}&eid={eid}&imageview=0&epedate={edate}&sedId={sedId}"
-
 
 def extract_meta_from_html(html: str) -> Dict[str, str]:
     soup = BeautifulSoup(html, "lxml")
@@ -134,9 +129,7 @@ def extract_meta_from_html(html: str) -> Dict[str, str]:
     title_matches = re.findall(r'property="og:title"\s+content=(.*?)\s*/>', html, re.IGNORECASE)
 
     if title_matches:
-        # Grab the LAST match in the array (the specific article title, ignoring the top generic one)
         raw_title = title_matches[-1].strip()
-        # Strip out "Common :" and any quotation marks
         title = re.sub(r'^"?Common\s*:\s*', '', raw_title, flags=re.IGNORECASE).strip('"\' ')
 
     # 2. Final fallback
@@ -157,6 +150,40 @@ def extract_meta_from_html(html: str) -> Dict[str, str]:
 
     return {"title": title, "description": desc, "image": image}
 
+def _escape_xml(text: str) -> str:
+    return (text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+def _write_rss_chunk(articles_chunk: List[Dict], edate: str, rfc_pub_date: str, xml_out_path: str, file_index: int):
+    with open(xml_out_path, "w", encoding="utf-8") as xf:
+        xf.write('<?xml version="1.0" encoding="utf-8"?>\n')
+        xf.write('<rss version="2.0">\n')
+        xf.write('  <channel>\n')
+        title_suffix = f" (part {file_index})" if file_index > 1 else ""
+        xf.write(f'    <title>Prothom Alo E-paper ({edate}){title_suffix}</title>\n')
+        xf.write(f'    <link>{BASE}</link>\n')
+        xf.write('    <description>Extracted articles from Prothom Alo E-paper</description>\n')
+        xf.write(f'    <pubDate>{rfc_pub_date}</pubDate>\n')
+
+        for a in articles_chunk:
+            title_safe = _escape_xml(str(a.get("Headline") or f"Article {a.get('OrgId')}"))
+            link_safe = _escape_xml(str(a.get("Link") or ""))
+            guid_safe = _escape_xml(str(a.get("OrgId") or ""))
+
+            img_url = a.get("ImageUrl") or ""
+            desc_text = a.get("Description") or ""
+            desc_html = f'<img src="{_escape_xml(img_url)}" /><br/><br/>' if img_url else ""
+            desc_html += _escape_xml(desc_text)
+
+            xf.write("    <item>\n")
+            xf.write(f"      <title>{title_safe}</title>\n")
+            xf.write(f"      <link>{link_safe}</link>\n")
+            xf.write(f"      <guid isPermaLink=\"false\">{guid_safe}</guid>\n")
+            xf.write(f"      <pubDate>{rfc_pub_date}</pubDate>\n")
+            xf.write(f"      <description><![CDATA[{desc_html}]]></description>\n")
+            xf.write("    </item>\n")
+
+        xf.write("  </channel>\n")
+        xf.write("</rss>\n")
 
 def run(edition: str, edition_date_override: Optional[str] = None):
     flaresolverr_url = os.getenv("FLARESOLVERR_URL", "").strip()
@@ -165,9 +192,8 @@ def run(edition: str, edition_date_override: Optional[str] = None):
         sys.exit(2)
 
     edate = today_str(edition_date_override)
-    # Generate an RFC-822 formatted date string for the RSS feed
     rfc_pub_date = format_datetime(now_bd())
-    
+
     print(f"[INFO] Starting extraction for Edition: {edition}, Date: {edate}")
 
     pages = fetch_json(f"{BASE}/Home/GetAllpages", params={"editionid": edition, "editiondate": edate})
@@ -178,7 +204,7 @@ def run(edition: str, edition_date_override: Optional[str] = None):
     os.makedirs(OUT_DIR, exist_ok=True)
     json_path = os.path.join(OUT_DIR, "articles.json")
     csv_path = os.path.join(OUT_DIR, "articles.csv")
-    xml_path = os.path.join(OUT_DIR, "articles.xml")
+    xml_base_path = os.path.join(OUT_DIR, "articles.xml")
 
     articles = []
 
@@ -202,9 +228,7 @@ def run(edition: str, edition_date_override: Optional[str] = None):
             mshare = make_mshare_link(orgid, edition, edate, SEDID)
             mindex = make_mindex_link(edition, edate, SEDID, page_id, UEMAIL)
 
-            # --- HYBRID FETCH LOGIC ---
             rendered = fetch_meta_as_social_bot(mshare)
-
             if not rendered:
                 rendered = fs_request_get(mshare, flaresolverr_url, fs_timeout=15)
 
@@ -213,7 +237,7 @@ def run(edition: str, edition_date_override: Optional[str] = None):
                 content = {"title": "", "description": "", "image": ""}
             else:
                 content = extract_meta_from_html(rendered)
-                print(f"[DEBUG] Meta extracted -> Title: '{content['title'][:40]}...' | Image: {'Yes' if content['image'] else 'No'}")
+                print(f"[DEBUG] Meta extracted -> Title: '{(content['title'] or '')[:40]}...' | Image: {'Yes' if content.get('image') else 'No'}")
 
             article = {
                 "OrgId": orgid,
@@ -223,9 +247,9 @@ def run(edition: str, edition_date_override: Optional[str] = None):
                 "PageTitle": page_title,
                 "EditionId": edition,
                 "EditionDate": edate,
-                "Headline": content["title"],
-                "Description": content["description"],
-                "ImageUrl": content["image"],
+                "Headline": content.get("title", ""),
+                "Description": content.get("description", ""),
+                "ImageUrl": content.get("image", ""),
                 "Link": mshare,
                 "MIndexBase": mindex
             }
@@ -249,43 +273,30 @@ def run(edition: str, edition_date_override: Optional[str] = None):
     else:
         open(csv_path, "w").close()
 
-    # --- Write as standard RSS 2.0 ---
-    with open(xml_path, "w", encoding="utf-8") as xf:
-        xf.write('<?xml version="1.0" encoding="utf-8"?>\n')
-        xf.write('<rss version="2.0">\n')
-        xf.write('  <channel>\n')
-        xf.write(f'    <title>Prothom Alo E-paper ({edate})</title>\n')
-        xf.write(f'    <link>{BASE}</link>\n')
-        xf.write('    <description>Extracted articles from Prothom Alo E-paper</description>\n')
-        xf.write(f'    <pubDate>{rfc_pub_date}</pubDate>\n')
-        
-        for a in articles:
-            # Escape XML special characters safely
-            title_safe = str(a.get("Headline") or f"Article {a.get('OrgId')}").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-            link_safe = str(a.get("Link") or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-            guid_safe = str(a.get("OrgId") or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-            
-            img_url = a.get("ImageUrl") or ""
-            desc_text = a.get("Description") or ""
-            
-            # Combine image and description safely inside CDATA
-            desc_html = f'<img src="{img_url}" /><br/><br/>' if img_url else ""
-            desc_html += desc_text
-            
-            xf.write("    <item>\n")
-            xf.write(f"      <title>{title_safe}</title>\n")
-            xf.write(f"      <link>{link_safe}</link>\n")
-            xf.write(f"      <guid isPermaLink=\"false\">{guid_safe}</guid>\n")
-            xf.write(f"      <pubDate>{rfc_pub_date}</pubDate>\n")
-            xf.write(f"      <description><![CDATA[{desc_html}]]></description>\n")
-            xf.write("    </item>\n")
-            
-        xf.write("  </channel>\n")
-        xf.write("</rss>\n")
+    # --- Write as standard RSS 2.0 with chunking if necessary ---
+    total = len(articles)
+    if total == 0:
+        # create an empty xml file
+        _write_rss_chunk([], edate, rfc_pub_date, xml_base_path, 1)
+        print(f"[SUCCESS] Total articles extracted: {total}")
+        print(f"[SUCCESS] Outputs saved to: {OUT_DIR}/")
+        return
 
-    print(f"[SUCCESS] Total articles extracted: {len(articles)}")
+    # Determine number of files needed
+    num_files = (total + XML_CHUNK_SIZE - 1) // XML_CHUNK_SIZE
+    for idx in range(num_files):
+        start = idx * XML_CHUNK_SIZE
+        end = start + XML_CHUNK_SIZE
+        chunk = articles[start:end]
+        if idx == 0:
+            out_path = xml_base_path
+        else:
+            out_path = os.path.join(OUT_DIR, f"articles_{idx+1}.xml")
+        print(f"[INFO] Writing XML file {idx+1}/{num_files}: {os.path.basename(out_path)} ({len(chunk)} items)")
+        _write_rss_chunk(chunk, edate, rfc_pub_date, out_path, idx+1)
+
+    print(f"[SUCCESS] Total articles extracted: {total}")
     print(f"[SUCCESS] Outputs saved to: {OUT_DIR}/")
-
 
 if __name__ == "__main__":
     import argparse
