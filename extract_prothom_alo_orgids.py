@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 """
-Extract Prothom Alo e-paper article metadata.
-Prioritizes Social Bot Spoofing for instant SSR extraction, falls back to FlareSolverr.
-Handles broken HTML (missing quotes) and duplicate generic meta tags.
-Outputs standard RSS 2.0 format for compatibility with feed readers.
-If more than 100 articles are extracted they overflow into additional XML files:
-  output/articles.xml, output/articles_2.xml, output/articles_3.xml, ...
-Articles whose Description contains the phrase "পৃষ্ঠার পর" are excluded from XML output.
+Prothom Alo e-paper extractor — updated:
+- Ensures full article is fetched (accounts for slow load; retries social-bot fetch briefly, falls back to FlareSolverr).
+- Parses both main article and linked article sections.
+- Excludes an article from XML ONLY when the main article's first non-empty line starts with the phrase "পৃষ্ঠার পর" (or contains it).
+  If the phrase appears in linked article or later in the main article, the article is kept.
 """
 import os
 import sys
@@ -35,7 +33,7 @@ DELAY = float(os.getenv("DELAY", "0.5"))
 OUT_DIR = "output"
 BD_TZ = "Asia/Dhaka"
 XML_CHUNK_SIZE = 100  # max articles per xml file
-EXCLUDE_PHRASE = "পৃষ্ঠার পর"  # phrase to exclude from XML
+EXCLUDE_PHRASE = "পৃষ্ঠার পর"  # phrase used for exclusion only if it is the first non-empty line of main article
 
 def now_bd() -> datetime:
     if ZoneInfo:
@@ -45,31 +43,40 @@ def now_bd() -> datetime:
 def today_str(override: Optional[str]) -> str:
     return override if override else now_bd().strftime("%d/%m/%Y")
 
-def fetch_meta_as_social_bot(url: str) -> Optional[str]:
-    """Pretend to be Facebook to get raw SSR meta tags instantly and bypass JS execution."""
+def html_has_story_body(html: str) -> bool:
+    return bool(re.search(r'id=["\']body["\']|class=["\']story_body["\']', html))
+
+def fetch_meta_as_social_bot(url: str, max_attempts: int = 3, attempt_delay: float = 0.6) -> Optional[str]:
+    """
+    Try to fetch as facebookexternalhit (fast SSR). If initial response doesn't contain the story body (page loads slowly),
+    retry a couple of times with a short delay. Caller can then fallback to FlareSolverr if necessary.
+    """
     headers = {
         "User-Agent": "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
         "Accept": "text/html"
     }
     print(f"[DEBUG] -> Spoofing Facebook Bot for: {url}")
-    try:
-        start = time.time()
-        r = requests.get(url, headers=headers, timeout=10)
-        elapsed = time.time() - start
+    for attempt in range(1, max_attempts + 1):
+        try:
+            start = time.time()
+            r = requests.get(url, headers=headers, timeout=10)
+            elapsed = time.time() - start
+            text = r.text if r.status_code == 200 else ""
+            # if og:title exists and the page contains a story body, accept it.
+            if r.status_code == 200 and ("og:title" in text or html_has_story_body(text)):
+                print(f"[DEBUG] <- Facebook Bot fetch successful (attempt {attempt}) in {elapsed:.2f}s")
+                return text
+            else:
+                print(f"[DEBUG] <- Facebook Bot attempt {attempt} incomplete (status={r.status_code}).")
+        except Exception as e:
+            print(f"[DEBUG] <- Facebook Bot fetch error on attempt {attempt}: {e}")
+        if attempt < max_attempts:
+            time.sleep(attempt_delay)
+    return None
 
-        if r.status_code == 200 and "og:title" in r.text:
-            print(f"[DEBUG] <- Facebook Bot fetch successful in {elapsed:.2f}s!")
-            return r.text
-        else:
-            print(f"[DEBUG] <- Facebook Bot missed the tags or got blocked (Status: {r.status_code}).")
-            return None
-    except Exception as e:
-        print(f"[DEBUG] <- Facebook Bot fetch error: {e}")
-        return None
-
-def fs_request_get(url: str, flaresolverr_url: str, fs_timeout: int = 15) -> Optional[str]:
-    """FlareSolverr fallback if the Social Bot fails."""
-    python_timeout = fs_timeout + 20
+def fs_request_get(url: str, flaresolverr_url: str, fs_timeout: int = 20) -> Optional[str]:
+    """FlareSolverr fallback with render=True to allow client-side content to be included."""
+    python_timeout = fs_timeout + 25
     payload = {
         "cmd": "request.get",
         "url": url,
@@ -80,18 +87,12 @@ def fs_request_get(url: str, flaresolverr_url: str, fs_timeout: int = 15) -> Opt
     print(f"[DEBUG] -> Sending to FlareSolverr Fallback: {url}")
     start_time = time.time()
     try:
-        r = requests.post(
-            f"{flaresolverr_url.rstrip('/')}/v1",
-            json=payload,
-            timeout=python_timeout
-        )
+        r = requests.post(f"{flaresolverr_url.rstrip('/')}/v1", json=payload, timeout=python_timeout)
         elapsed = time.time() - start_time
         r.raise_for_status()
         data = r.json()
-
         status = data.get("status", "unknown")
-        print(f"[DEBUG] <- FlareSolverr returned '{status}' in {elapsed:.2f} seconds.")
-
+        print(f"[DEBUG] <- FlareSolverr returned '{status}' in {elapsed:.2f}s.")
         if isinstance(data, dict):
             sol = data.get("solution")
             if isinstance(sol, dict) and "response" in sol:
@@ -124,33 +125,77 @@ def make_mshare_link(orgid: str, eid: str, edate: str, sedId: str) -> str:
     return f"{BASE}/Home/MShareArticle?OrgId={orgid}&eid={eid}&imageview=0&epedate={edate}&sedId={sedId}"
 
 def extract_meta_from_html(html: str) -> Dict[str, str]:
+    """
+    Returns dict with: title, description (combined main+linked if present), image (last og:image found).
+    Also keeps the raw html for additional checks (e.g. start-line exclusion).
+    """
     soup = BeautifulSoup(html, "lxml")
     title = ""
 
-    # 1. Regex to find ALL og:titles, bypassing BeautifulSoup's broken parsing of unquoted attributes
-    title_matches = re.findall(r'property="og:title"\s+content=(.*?)\s*/>', html, re.IGNORECASE)
-
+    # Prefer og:title matches (take the last article-specific one)
+    title_matches = re.findall(r'property=["\']og:title["\']\s+content=(.*?)\s*/>', html, re.IGNORECASE)
     if title_matches:
         raw_title = title_matches[-1].strip()
         title = re.sub(r'^"?Common\s*:\s*', '', raw_title, flags=re.IGNORECASE).strip('"\' ')
 
-    # 2. Final fallback
     if not title and soup.title and soup.title.string:
         title = soup.title.string.strip()
 
-    # Find ALL descriptions and take the last one
-    desc = ""
-    og_descs = soup.find_all("meta", property="og:description") or soup.find_all("meta", attrs={"name": "twitter:description"})
-    if og_descs and og_descs[-1].get("content"):
-        desc = og_descs[-1].get("content").strip()
+    # Extract main article description (collect paragraphs inside #body / .story_body)
+    main_desc = ""
+    body_div = soup.find(id="body") or soup.find(class_="story_body")
+    if body_div:
+        # join paragraph texts preserving order; strip empty ones
+        p_texts = [p.get_text(separator=" ", strip=True) for p in body_div.find_all("p")]
+        p_texts = [t for t in p_texts if t]
+        main_desc = "\n\n".join(p_texts)
 
-    # Find ALL images and take the last one
+    # Extract linked article description (if present)
+    linked_desc = ""
+    linked_div = soup.find(id="divlinkedstorybody") or soup.select_one("#divlinkedstory .divlinkedstorybody")
+    if linked_div:
+        lp_texts = [p.get_text(separator=" ", strip=True) for p in linked_div.find_all("p")]
+        lp_texts = [t for t in lp_texts if t]
+        linked_desc = "\n\n".join(lp_texts)
+
+    # Combined description: main + (separator + linked) if linked exists
+    description = main_desc
+    if linked_desc:
+        description = (main_desc + "\n\n---linked---\n\n" + linked_desc) if main_desc else linked_desc
+
+    # Get last og:image or twitter:image
     image = ""
     og_imgs = soup.find_all("meta", property="og:image") or soup.find_all("meta", attrs={"name": "twitter:image"})
     if og_imgs and og_imgs[-1].get("content"):
         image = og_imgs[-1].get("content").strip()
 
-    return {"title": title, "description": desc, "image": image}
+    return {"title": title, "description": description, "image": image, "raw_html": html}
+
+def main_article_starts_with_phrase(html: str, phrase: str) -> bool:
+    """
+    Check whether the main article's first non-empty paragraph contains the phrase.
+    - Only inspects the MAIN article (div#body or .story_body).
+    - Returns True only when the FIRST non-empty line in the main article contains the phrase.
+    """
+    if not html:
+        return False
+    soup = BeautifulSoup(html, "lxml")
+    body_div = soup.find(id="body") or soup.find(class_="story_body")
+    if not body_div:
+        return False
+    # iterate through direct paragraphs in the body in document order
+    for el in body_div.find_all(["p", "div"]):
+        text = el.get_text(separator=" ", strip=True)
+        if not text:
+            continue
+        # Normalize whitespace
+        text_norm = re.sub(r'\s+', ' ', text).strip()
+        # If phrase appears in this first non-empty line -> exclude
+        if phrase in text_norm:
+            return True
+        # if first non-empty line does not contain phrase => don't exclude
+        return False
+    return False
 
 def _escape_xml(text: str) -> str:
     return (text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -174,6 +219,7 @@ def _write_rss_chunk(articles_chunk: List[Dict], edate: str, rfc_pub_date: str, 
             img_url = a.get("ImageUrl") or ""
             desc_text = a.get("Description") or ""
             desc_html = f'<img src="{_escape_xml(img_url)}" /><br/><br/>' if img_url else ""
+            # keep description escaped inside CDATA to avoid XML breakage
             desc_html += _escape_xml(desc_text)
 
             xf.write("    <item>\n")
@@ -230,17 +276,19 @@ def run(edition: str, edition_date_override: Optional[str] = None):
             mshare = make_mshare_link(orgid, edition, edate, SEDID)
             mindex = make_mindex_link(edition, edate, SEDID, page_id, UEMAIL)
 
-            rendered = fetch_meta_as_social_bot(mshare)
-            if not rendered:
-                rendered = fs_request_get(mshare, flaresolverr_url, fs_timeout=15)
+            # Hybrid fetch: try social bot with retries, then FlareSolverr render if necessary.
+            rendered = fetch_meta_as_social_bot(mshare, max_attempts=3, attempt_delay=0.6)
+            if not rendered or not html_has_story_body(rendered):
+                rendered = fs_request_get(mshare, flaresolverr_url, fs_timeout=22)
 
             if not rendered:
                 print(f"[WARNING] Content missing for OrgId={orgid}. Saving empty metadata.")
-                content = {"title": "", "description": "", "image": ""}
+                content = {"title": "", "description": "", "image": "", "raw_html": ""}
             else:
                 content = extract_meta_from_html(rendered)
-                print(f"[DEBUG] Meta extracted -> Title: '{(content['title'] or '')[:40]}...' | Image: {'Yes' if content.get('image') else 'No'}")
+                print(f"[DEBUG] Meta extracted -> Title: '{(content.get('title') or '')[:40]}...' | Image: {'Yes' if content.get('image') else 'No'}")
 
+            # Build article record
             article = {
                 "OrgId": orgid,
                 "StoryId": storyid,
@@ -253,8 +301,10 @@ def run(edition: str, edition_date_override: Optional[str] = None):
                 "Description": content.get("description", ""),
                 "ImageUrl": content.get("image", ""),
                 "Link": mshare,
-                "MIndexBase": mindex
+                "MIndexBase": mindex,
+                "raw_html": content.get("raw_html", "")
             }
+
             articles.append(article)
 
             print(f"[DEBUG] Sleeping for {DELAY}s...")
@@ -275,29 +325,29 @@ def run(edition: str, edition_date_override: Optional[str] = None):
     else:
         open(csv_path, "w").close()
 
-    # --- Filter articles for XML (exclude those whose description contains EXCLUDE_PHRASE) ---
+    # --- Filter articles for XML using the new rule:
+    # Exclude ONLY if the main article's first non-empty line contains EXCLUDE_PHRASE.
     xml_articles = []
+    excluded_count = 0
     for a in articles:
-        desc = (a.get("Description") or "")
-        if EXCLUDE_PHRASE in desc:
-            # article excluded from XML, but retained in JSON/CSV
+        raw_html = a.get("raw_html") or ""
+        if main_article_starts_with_phrase(raw_html, EXCLUDE_PHRASE):
+            excluded_count += 1
+            # keep in JSON/CSV but exclude from XML
             continue
         xml_articles.append(a)
 
-    excluded_count = len(articles) - len(xml_articles)
     if excluded_count:
-        print(f"[INFO] Excluding {excluded_count} article(s) from XML because Description contains '{EXCLUDE_PHRASE}'.")
+        print(f"[INFO] Excluding {excluded_count} article(s) from XML because the main article starts with '{EXCLUDE_PHRASE}'.")
 
     # --- Write as standard RSS 2.0 with chunking if necessary ---
     total_xml = len(xml_articles)
     if total_xml == 0:
-        # create an empty xml file
         _write_rss_chunk([], edate, rfc_pub_date, xml_base_path, 1)
         print(f"[SUCCESS] Total articles extracted: {len(articles)} (XML contains 0 items after exclusions)")
         print(f"[SUCCESS] Outputs saved to: {OUT_DIR}/")
         return
 
-    # Determine number of files needed
     num_files = (total_xml + XML_CHUNK_SIZE - 1) // XML_CHUNK_SIZE
     for idx in range(num_files):
         start = idx * XML_CHUNK_SIZE
