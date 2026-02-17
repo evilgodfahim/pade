@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       EDITION_ID: '1'
-      EDITION_DATE: ${{ env.EDITION_DATE || '' }}
+      EDITION_DATE: ''          # empty by default; available to steps as $EDITION_DATE
       FLARESOLVERR_URL: 'http://127.0.0.1:8191'
       UEMAIL: '1169c825b8'
       SEDID: '1'
@@ -35,7 +35,7 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install Python dependencies
+      - name: Install Python dependencies (if present)
         run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
@@ -46,7 +46,7 @@ jobs:
           docker run -d --name flaresolverr -p 8191:8191 --restart=no ghcr.io/flaresolverr/flaresolverr:latest
           echo "waiting for flaresolverr to respond..."
           for i in $(seq 1 18); do
-            if curl -sS --max-time 3 "${{ env.FLARESOLVERR_URL }}" >/dev/null 2>&1; then
+            if curl -sS --max-time 3 "${FLARESOLVERR_URL}" >/dev/null 2>&1; then
               echo "flaresolverr is up"
               break
             fi
@@ -56,18 +56,17 @@ jobs:
       - name: Run extractor script
         run: |
           set -o pipefail
-          python extract_prothom_alo_orgids.py --edition "${EDITION_ID}" --date "${EDITION_DATE}" || true
+          python extract_prothom_alo_orgids.py --edition "$EDITION_ID" --date "$EDITION_DATE" || true
 
       - name: Collect XML and CSV artifacts
         run: |
           set -e
           mkdir -p artifacts/xml_csv
-          # Collect from output/ and repo root (limit depth)
           if [ -d output ]; then
             find output -type f \( -iname '*.xml' -o -iname '*.csv' \) -exec cp --parents '{}' artifacts/xml_csv/ \; || true
           fi
           find . -maxdepth 2 -type f \( -iname '*.xml' -o -iname '*.csv' \) -not -path "./.git/*" -exec cp --parents '{}' artifacts/xml_csv/ \; || true
-          echo "collected:"
+          echo "collected files:"
           ls -R artifacts/xml_csv || true
 
       - name: Commit collected XML/CSV back to repo
