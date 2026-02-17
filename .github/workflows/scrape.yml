@@ -12,88 +12,82 @@ permissions:
 jobs:
   scrape-and-commit:
     runs-on: ubuntu-latest
+    env:
+      EDITION_ID: '1'
+      EDITION_DATE: ${{ env.EDITION_DATE || '' }}
+      FLARESOLVERR_URL: 'http://127.0.0.1:8191'
+      UEMAIL: '1169c825b8'
+      SEDID: '1'
+      DELAY: '0.5'
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Install system deps
+      - name: Install system packages
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y jq
+          sudo apt-get install -y jq curl git ca-certificates
 
-      - name: Set up Python
+      - name: Setup Python 3.11
         uses: actions/setup-python@v4
         with:
           python-version: '3.11'
 
-      - name: Install Python deps
+      - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Start FlareSolverr (Direct pull from GHCR)
+      - name: Launch FlareSolverr container
         run: |
-          # Pull and run FlareSolverr in the background
-          docker run -d -p 8191:8191 ghcr.io/flaresolverr/flaresolverr:latest
-          # Give it a few seconds to fully boot up
-          sleep 10
+          docker rm -f flaresolverr 2>/dev/null || true
+          docker run -d --name flaresolverr -p 8191:8191 --restart=no ghcr.io/flaresolverr/flaresolverr:latest
+          echo "waiting for flaresolverr to respond..."
+          for i in $(seq 1 18); do
+            if curl -sS --max-time 3 "${{ env.FLARESOLVERR_URL }}" >/dev/null 2>&1; then
+              echo "flaresolverr is up"
+              break
+            fi
+            sleep 5
+          done
 
-      - name: Run extractor
-        env:
-          EDITION_ID: '1'
-          EDITION_DATE: ${{ env.EDITION_DATE || '' }}
-          # Point directly to the local instance running on the runner
-          FLARESOLVERR_URL: 'http://127.0.0.1:8191'
-          UEMAIL: '1169c825b8'
-          SEDID: '1'
-          DELAY: '0.5'
+      - name: Run extractor script
         run: |
+          set -o pipefail
           python extract_prothom_alo_orgids.py --edition "${EDITION_ID}" --date "${EDITION_DATE}" || true
 
-      - name: Run mk downloader (save JS/API/HTML into mk/latest)
+      - name: Collect XML and CSV artifacts
+        run: |
+          set -e
+          mkdir -p artifacts/xml_csv
+          # Collect from output/ and repo root (limit depth)
+          if [ -d output ]; then
+            find output -type f \( -iname '*.xml' -o -iname '*.csv' \) -exec cp --parents '{}' artifacts/xml_csv/ \; || true
+          fi
+          find . -maxdepth 2 -type f \( -iname '*.xml' -o -iname '*.csv' \) -not -path "./.git/*" -exec cp --parents '{}' artifacts/xml_csv/ \; || true
+          echo "collected:"
+          ls -R artifacts/xml_csv || true
+
+      - name: Commit collected XML/CSV back to repo
         env:
-          EDITION_ID: '1'
-          EDITION_DATE: ${{ env.EDITION_DATE || '' }}
+          GIT_AUTHOR_NAME: "github-actions[bot]"
+          GIT_AUTHOR_EMAIL: "41898282+github-actions[bot]@users.noreply.github.com"
         run: |
-          chmod +x mk_download.sh
-          ./mk_download.sh "${EDITION_ID}" "${EDITION_DATE}" || true
-          # move mk to mk/latest (overwrite)
-          rm -rf mk/latest || true
-          mkdir -p mk/latest
-          mv mk/* mk/latest 2>/dev/null || true
+          set -e
+          git config user.name "${GIT_AUTHOR_NAME}"
+          git config user.email "${GIT_AUTHOR_EMAIL}"
 
-      - name: Commit results (overwrite outputs)
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Stage only xml/csv artifacts (and any existing output xml/csv)
+          git add -A || true
+          git add -f artifacts/xml_csv || true
+          git add -f output/**/*.xml output/**/*.csv 2>/dev/null || true
+          git add -f output/*.xml output/*.csv 2>/dev/null || true
 
-          echo "---- workspace listing ----"
-          ls -la || true
-          echo "---- output dir ----"
-          ls -la output || true
-          echo "---- mk/latest ----"
-          ls -la mk/latest || true
-
-          # stage outputs (force-add if .gitignore blocks them)
-          git add -A
-          git add -f output || true
-          git add -f mk/latest || true
-
-          echo "---- git status (pre-commit) ----"
-          git status --porcelain
-          echo "---- git diff (names) staged ----"
-          git diff --name-only --cached || true
-
-          git commit -m "Daily epaper extract: $(date -u +'%Y-%m-%d %H:%M UTC')" || {
-            echo "No changes to commit"
-            git status --porcelain
-            exit 0
-          }
-
-          git push origin HEAD:main || {
-            echo "Push failed"
-            git remote -v
-            exit 1
-          }
+          if git diff --cached --name-only | grep -E '\.xml$|\.csv$' >/dev/null 2>&1; then
+            git commit -m "Daily epaper extract: $(date -u +'%Y-%m-%d %H:%M UTC')"
+            git push origin HEAD:main
+          else
+            echo "No XML/CSV changes to commit."
+          fi
