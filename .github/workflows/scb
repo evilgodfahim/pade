@@ -1,0 +1,99 @@
+name: daily-epaper-extract
+
+on:
+  schedule:
+    # 09:00 Asia/Dhaka = 03:00 UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  scrape-and-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Start FlareSolverr (Direct pull from GHCR)
+        run: |
+          # Pull and run FlareSolverr in the background
+          docker run -d -p 8191:8191 ghcr.io/flaresolverr/flaresolverr:latest
+          # Give it a few seconds to fully boot up
+          sleep 10
+
+      - name: Run extractor
+        env:
+          EDITION_ID: '1'
+          EDITION_DATE: ${{ env.EDITION_DATE || '' }}
+          # Point directly to the local instance running on the runner
+          FLARESOLVERR_URL: 'http://127.0.0.1:8191'
+          UEMAIL: '1169c825b8'
+          SEDID: '1'
+          DELAY: '0.5'
+        run: |
+          python extract_prothom_alo_orgids.py --edition "${EDITION_ID}" --date "${EDITION_DATE}" || true
+
+      - name: Run mk downloader (save JS/API/HTML into mk/latest)
+        env:
+          EDITION_ID: '1'
+          EDITION_DATE: ${{ env.EDITION_DATE || '' }}
+        run: |
+          chmod +x mk_download.sh
+          ./mk_download.sh "${EDITION_ID}" "${EDITION_DATE}" || true
+          # move mk to mk/latest (overwrite)
+          rm -rf mk/latest || true
+          mkdir -p mk/latest
+          mv mk/* mk/latest 2>/dev/null || true
+
+      - name: Commit results (overwrite outputs)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          echo "---- workspace listing ----"
+          ls -la || true
+          echo "---- output dir ----"
+          ls -la output || true
+          echo "---- mk/latest ----"
+          ls -la mk/latest || true
+
+          # stage outputs (force-add if .gitignore blocks them)
+          git add -A
+          git add -f output || true
+          git add -f mk/latest || true
+
+          echo "---- git status (pre-commit) ----"
+          git status --porcelain
+          echo "---- git diff (names) staged ----"
+          git diff --name-only --cached || true
+
+          git commit -m "Daily epaper extract: $(date -u +'%Y-%m-%d %H:%M UTC')" || {
+            echo "No changes to commit"
+            git status --porcelain
+            exit 0
+          }
+
+          git push origin HEAD:main || {
+            echo "Push failed"
+            git remote -v
+            exit 1
+          }
