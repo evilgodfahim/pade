@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
 """
-Extract Prothom Alo e-paper article metadata.
-Prioritizes Social Bot Spoofing for instant SSR extraction, falls back to FlareSolverr.
-Handles broken HTML (missing quotes) and duplicate generic meta tags.
-Outputs standard RSS 2.0 format for compatibility with feed readers.
-If more than 100 articles are extracted they overflow into additional XML files:
-  output/articles.xml, output/articles_2.xml, output/articles_3.xml, ...
-Articles whose Description contains the phrase "পৃষ্ঠার পর" are excluded from XML output.
+Prothom Alo e-paper extractor — improved image resolution and dedupe.
+- removes leading "ঢাকা সংস্করণ : " from titles
+- avoids duplicate items by link or normalized title
+- picks highest-resolution image candidate (srcset, data-src, og:image, img src)
 """
 import os
 import sys
@@ -16,7 +13,8 @@ import csv
 import re
 from datetime import datetime
 from email.utils import format_datetime
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
+from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
@@ -34,84 +32,60 @@ UEMAIL = os.getenv("UEMAIL", "1169c825b8")
 DELAY = float(os.getenv("DELAY", "0.5"))
 OUT_DIR = "output"
 BD_TZ = "Asia/Dhaka"
-XML_CHUNK_SIZE = 100  # max articles per xml file
-EXCLUDE_PHRASE = "পৃষ্ঠার পর"  # phrase to exclude from XML
+XML_CHUNK_SIZE = 100
+EXCLUDE_PHRASE = "পৃষ্ঠার পর"
+
+# remove leading variants of 'ঢাকা সংস্করণ : '
+_DHAKA_PREFIX_RE = re.compile(r"^\s*ঢাকা\s*সংস্করণ\s*[:\-]?\s*", flags=re.IGNORECASE)
+
 
 def now_bd() -> datetime:
     if ZoneInfo:
         return datetime.now(ZoneInfo(BD_TZ))
     return datetime.now()
 
+
 def today_str(override: Optional[str]) -> str:
     return override if override else now_bd().strftime("%d/%m/%Y")
 
+
 def fetch_meta_as_social_bot(url: str) -> Optional[str]:
-    """Pretend to be Facebook to get raw SSR meta tags instantly and bypass JS execution."""
     headers = {
         "User-Agent": "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
         "Accept": "text/html"
     }
-    print(f"[DEBUG] -> Spoofing Facebook Bot for: {url}")
     try:
-        start = time.time()
         r = requests.get(url, headers=headers, timeout=10)
-        elapsed = time.time() - start
-
         if r.status_code == 200 and "og:title" in r.text:
-            print(f"[DEBUG] <- Facebook Bot fetch successful in {elapsed:.2f}s!")
             return r.text
-        else:
-            print(f"[DEBUG] <- Facebook Bot missed the tags or got blocked (Status: {r.status_code}).")
-            return None
-    except Exception as e:
-        print(f"[DEBUG] <- Facebook Bot fetch error: {e}")
         return None
+    except Exception:
+        return None
+
 
 def fs_request_get(url: str, flaresolverr_url: str, fs_timeout: int = 15) -> Optional[str]:
-    """FlareSolverr fallback if the Social Bot fails."""
     python_timeout = fs_timeout + 20
-    payload = {
-        "cmd": "request.get",
-        "url": url,
-        "maxTimeout": fs_timeout * 1000,
-        "render": True
-    }
-
-    print(f"[DEBUG] -> Sending to FlareSolverr Fallback: {url}")
-    start_time = time.time()
+    payload = {"cmd": "request.get", "url": url, "maxTimeout": fs_timeout * 1000, "render": True}
     try:
-        r = requests.post(
-            f"{flaresolverr_url.rstrip('/')}/v1",
-            json=payload,
-            timeout=python_timeout
-        )
-        elapsed = time.time() - start_time
+        r = requests.post(f"{flaresolverr_url.rstrip('/')}/v1", json=payload, timeout=python_timeout)
         r.raise_for_status()
         data = r.json()
-
-        status = data.get("status", "unknown")
-        print(f"[DEBUG] <- FlareSolverr returned '{status}' in {elapsed:.2f} seconds.")
-
-        if isinstance(data, dict):
-            sol = data.get("solution")
-            if isinstance(sol, dict) and "response" in sol:
-                return sol["response"]
-            if "response" in data:
-                return data["response"]
+        sol = data.get("solution") or data
+        if isinstance(sol, dict):
+            return sol.get("response")
         return None
-    except Exception as e:
-        elapsed = time.time() - start_time
-        print(f"[ERROR] <- FlareSolverr fetch failed after {elapsed:.2f}s for {url}: {e}", file=sys.stderr)
+    except Exception:
         return None
+
 
 def fetch_json(url: str, params: dict = None, timeout: int = 15) -> Optional[dict]:
     try:
         r = requests.get(url, params=params, timeout=timeout)
         r.raise_for_status()
         return r.json()
-    except Exception as e:
-        print(f"[ERROR] Failed JSON fetch {url}: {e}", file=sys.stderr)
+    except Exception:
         return None
+
 
 def make_mindex_link(eid: str, edate: str, sedId: str, pgid: int, uemail: str) -> str:
     return (
@@ -120,40 +94,155 @@ def make_mindex_link(eid: str, edate: str, sedId: str, pgid: int, uemail: str) -
         f"&isIssueRefresh=False&uemail={uemail}"
     )
 
+
 def make_mshare_link(orgid: str, eid: str, edate: str, sedId: str) -> str:
     return f"{BASE}/Home/MShareArticle?OrgId={orgid}&eid={eid}&imageview=0&epedate={edate}&sedId={sedId}"
 
-def extract_meta_from_html(html: str) -> Dict[str, str]:
+
+# ---------------- image helpers ----------------
+
+def _parse_srcset(srcset: str) -> List[Tuple[str, int]]:
+    items: List[Tuple[str, int]] = []
+    for part in srcset.split(","):
+        p = part.strip()
+        if not p:
+            continue
+        pieces = p.split()
+        url = pieces[0]
+        w = 0
+        if len(pieces) > 1:
+            try:
+                if pieces[1].endswith("w"):
+                    w = int(pieces[1][:-1])
+                elif pieces[1].endswith("x"):
+                    w = int(float(pieces[1][:-1]) * 100)
+            except Exception:
+                w = 0
+        items.append((url, w))
+    return items
+
+
+def _normalize_image_url(url: str) -> str:
+    if not url:
+        return url
+    # protocol-relative
+    if url.startswith("//"):
+        url = "https:" + url
+    # remove common size query params
+    url = re.sub(r'([?&])w=\d+(&|$)', r'\1', url)
+    url = re.sub(r'([?&])width=\d+(&|$)', r'\1', url)
+    # remove suffixes like _200x200 before extension
+    url = re.sub(r'(_\d+x\d+)(\.\w{2,5})$', r'\2', url)
+    # remove ".thumbnail" style suffix
+    url = re.sub(r'(\.thumbnail)(\.\w{2,5})$', r'\2', url)
+    # heuristics
+    url = url.replace("/thumb/", "/").replace("/thumbnail/", "/")
+    return url
+
+
+def _head_content_length(url: str, timeout: int = 6) -> Tuple[int, str]:
+    try:
+        h = requests.head(url, allow_redirects=True, timeout=timeout)
+        if h.status_code >= 400:
+            return 0, ""
+        cl = h.headers.get("Content-Length")
+        ct = h.headers.get("Content-Type", "")
+        size = int(cl) if cl and cl.isdigit() else 0
+        return size, ct
+    except Exception:
+        return 0, ""
+
+
+def extract_meta_from_html(html: str, page_url: Optional[str] = None) -> Dict[str, str]:
+    """
+    Returns dict: {"title":..., "description":..., "image":...}
+    Image selection:
+     - gather candidates from og:image, link rel=image_src, img srcset, data-src/data-original, src
+     - normalize and resolve relative URLs (page_url)
+     - probe HEAD for Content-Length and prefer largest image that is an image MIME type
+     - fallback to first candidate if probing fails
+    """
     soup = BeautifulSoup(html, "lxml")
     title = ""
 
-    # 1. Regex to find ALL og:titles, bypassing BeautifulSoup's broken parsing of unquoted attributes
-    title_matches = re.findall(r'property="og:title"\s+content=(.*?)\s*/>', html, re.IGNORECASE)
-
+    # try robust og:title capture (handles broken attributes)
+    title_matches = re.findall(r'property=["\']og:title["\']\s+content=(.*?)\s*/?>', html, re.IGNORECASE)
     if title_matches:
         raw_title = title_matches[-1].strip()
-        title = re.sub(r'^"?Common\s*:\s*', '', raw_title, flags=re.IGNORECASE).strip('"\' ')
+        title = re.sub(r'^\"?Common\s*:\s*', '', raw_title, flags=re.IGNORECASE).strip('"\' ')
 
-    # 2. Final fallback
     if not title and soup.title and soup.title.string:
         title = soup.title.string.strip()
 
-    # Find ALL descriptions and take the last one
+    # description
     desc = ""
     og_descs = soup.find_all("meta", property="og:description") or soup.find_all("meta", attrs={"name": "twitter:description"})
     if og_descs and og_descs[-1].get("content"):
         desc = og_descs[-1].get("content").strip()
 
-    # Find ALL images and take the last one
-    image = ""
+    candidates: List[str] = []
+
+    # og:image
     og_imgs = soup.find_all("meta", property="og:image") or soup.find_all("meta", attrs={"name": "twitter:image"})
     if og_imgs and og_imgs[-1].get("content"):
-        image = og_imgs[-1].get("content").strip()
+        candidates.append(og_imgs[-1].get("content").strip())
 
-    return {"title": title, "description": desc, "image": image}
+    # link rel=image_src
+    link_img = soup.find("link", rel="image_src")
+    if link_img and link_img.get("href"):
+        candidates.append(link_img.get("href").strip())
+
+    # img tags
+    for img in soup.find_all("img"):
+        srcset = img.get("srcset") or img.get("data-srcset")
+        if srcset:
+            for u, w in _parse_srcset(srcset):
+                candidates.append(u)
+            continue
+        # lazy attributes
+        for attr in ("data-original", "data-src", "data-lazy", "data-defer-src", "data-echo"):
+            val = img.get(attr)
+            if val:
+                candidates.append(val.strip())
+                break
+        # fallback src
+        src = img.get("src")
+        if src:
+            candidates.append(src.strip())
+
+    # resolve and normalize
+    resolved: List[str] = []
+    for c in candidates:
+        if not c:
+            continue
+        if c.startswith("//"):
+            c = "https:" + c
+        if page_url and not re.match(r'^https?:', c):
+            c = urljoin(page_url, c)
+        c = _normalize_image_url(c)
+        if c and c not in resolved:
+            resolved.append(c)
+
+    if not resolved:
+        return {"title": title, "description": desc, "image": ""}
+
+    # probe HEAD and pick largest image (as proxy for resolution)
+    best_url = resolved[0]
+    best_size = 0
+    for u in resolved:
+        size, ctype = _head_content_length(u)
+        if ctype and "image" not in ctype.lower():
+            continue
+        if size > best_size:
+            best_size = size
+            best_url = u
+
+    return {"title": title, "description": desc, "image": best_url}
+
 
 def _escape_xml(text: str) -> str:
     return (text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
 
 def _write_rss_chunk(articles_chunk: List[Dict], edate: str, rfc_pub_date: str, xml_out_path: str, file_index: int):
     with open(xml_out_path, "w", encoding="utf-8") as xf:
@@ -187,6 +276,7 @@ def _write_rss_chunk(articles_chunk: List[Dict], edate: str, rfc_pub_date: str, 
         xf.write("  </channel>\n")
         xf.write("</rss>\n")
 
+
 def run(edition: str, edition_date_override: Optional[str] = None):
     flaresolverr_url = os.getenv("FLARESOLVERR_URL", "").strip()
     if not flaresolverr_url:
@@ -195,8 +285,6 @@ def run(edition: str, edition_date_override: Optional[str] = None):
 
     edate = today_str(edition_date_override)
     rfc_pub_date = format_datetime(now_bd())
-
-    print(f"[INFO] Starting extraction for Edition: {edition}, Date: {edate}")
 
     pages = fetch_json(f"{BASE}/Home/GetAllpages", params={"editionid": edition, "editiondate": edate})
     if not pages:
@@ -208,7 +296,9 @@ def run(edition: str, edition_date_override: Optional[str] = None):
     csv_path = os.path.join(OUT_DIR, "articles.csv")
     xml_base_path = os.path.join(OUT_DIR, "articles.xml")
 
-    articles = []
+    articles: List[Dict] = []
+    seen_links = set()
+    seen_titles = set()
 
     for p in pages:
         page_id = p.get("PageId")
@@ -217,16 +307,13 @@ def run(edition: str, edition_date_override: Optional[str] = None):
         if not page_id:
             continue
 
-        print(f"\n[INFO] --- Scanning Page {page_no} (ID: {page_id}) ---")
         stories = fetch_json(f"{BASE}/Home/getStoriesOnPage", params={"pageid": page_id}) or []
-
         for s in stories:
             orgid = s.get("OrgId")
             storyid = s.get("storyid")
             if not orgid:
                 continue
 
-            print(f"[INFO] Processing OrgId: {orgid}")
             mshare = make_mshare_link(orgid, edition, edate, SEDID)
             mindex = make_mindex_link(edition, edate, SEDID, page_id, UEMAIL)
 
@@ -235,11 +322,13 @@ def run(edition: str, edition_date_override: Optional[str] = None):
                 rendered = fs_request_get(mshare, flaresolverr_url, fs_timeout=15)
 
             if not rendered:
-                print(f"[WARNING] Content missing for OrgId={orgid}. Saving empty metadata.")
                 content = {"title": "", "description": "", "image": ""}
             else:
-                content = extract_meta_from_html(rendered)
-                print(f"[DEBUG] Meta extracted -> Title: '{(content['title'] or '')[:40]}...' | Image: {'Yes' if content.get('image') else 'No'}")
+                # pass page_url so relative image URLs and srcset entries resolve correctly
+                content = extract_meta_from_html(rendered, page_url=mshare)
+
+            raw_title = content.get("title") or ""
+            cleaned_title = _DHAKA_PREFIX_RE.sub("", raw_title).strip()
 
             article = {
                 "OrgId": orgid,
@@ -249,21 +338,33 @@ def run(edition: str, edition_date_override: Optional[str] = None):
                 "PageTitle": page_title,
                 "EditionId": edition,
                 "EditionDate": edate,
-                "Headline": content.get("title", ""),
+                "Headline": cleaned_title,
                 "Description": content.get("description", ""),
                 "ImageUrl": content.get("image", ""),
                 "Link": mshare,
                 "MIndexBase": mindex
             }
-            articles.append(article)
 
-            print(f"[DEBUG] Sleeping for {DELAY}s...")
+            norm_link = (article.get("Link") or "").strip()
+            norm_title = re.sub(r"\s+", " ", (article.get("Headline") or "").strip()).lower()
+
+            if norm_link in seen_links or (norm_title and norm_title in seen_titles):
+                # duplicate; skip
+                pass
+            else:
+                articles.append(article)
+                if norm_link:
+                    seen_links.add(norm_link)
+                if norm_title:
+                    seen_titles.add(norm_title)
+
             time.sleep(DELAY)
 
-    print("\n[INFO] Writing files to disk...")
+    # write JSON
     with open(json_path, "w", encoding="utf-8") as jf:
         json.dump(articles, jf, ensure_ascii=False, indent=2)
 
+    # write CSV
     if articles:
         with open(csv_path, "w", newline="", encoding="utf-8") as cf:
             fieldnames = ["OrgId", "StoryId", "PageNo", "PageId", "PageTitle", "EditionId", "EditionDate", "Headline", "Description", "ImageUrl", "Link", "MIndexBase"]
@@ -275,43 +376,27 @@ def run(edition: str, edition_date_override: Optional[str] = None):
     else:
         open(csv_path, "w").close()
 
-    # --- Filter articles for XML (exclude those whose description contains EXCLUDE_PHRASE) ---
+    # filter exclusions
     xml_articles = []
     for a in articles:
         desc = (a.get("Description") or "")
         if EXCLUDE_PHRASE in desc:
-            # article excluded from XML, but retained in JSON/CSV
             continue
         xml_articles.append(a)
 
-    excluded_count = len(articles) - len(xml_articles)
-    if excluded_count:
-        print(f"[INFO] Excluding {excluded_count} article(s) from XML because Description contains '{EXCLUDE_PHRASE}'.")
-
-    # --- Write as standard RSS 2.0 with chunking if necessary ---
     total_xml = len(xml_articles)
     if total_xml == 0:
-        # create an empty xml file
         _write_rss_chunk([], edate, rfc_pub_date, xml_base_path, 1)
-        print(f"[SUCCESS] Total articles extracted: {len(articles)} (XML contains 0 items after exclusions)")
-        print(f"[SUCCESS] Outputs saved to: {OUT_DIR}/")
         return
 
-    # Determine number of files needed
     num_files = (total_xml + XML_CHUNK_SIZE - 1) // XML_CHUNK_SIZE
     for idx in range(num_files):
         start = idx * XML_CHUNK_SIZE
         end = start + XML_CHUNK_SIZE
         chunk = xml_articles[start:end]
-        if idx == 0:
-            out_path = xml_base_path
-        else:
-            out_path = os.path.join(OUT_DIR, f"articles_{idx+1}.xml")
-        print(f"[INFO] Writing XML file {idx+1}/{num_files}: {os.path.basename(out_path)} ({len(chunk)} items)")
-        _write_rss_chunk(chunk, edate, rfc_pub_date, out_path, idx+1)
+        out_path = xml_base_path if idx == 0 else os.path.join(OUT_DIR, f"articles_{idx+1}.xml")
+        _write_rss_chunk(chunk, edate, rfc_pub_date, out_path, idx + 1)
 
-    print(f"[SUCCESS] Total articles extracted: {len(articles)} (XML contains {total_xml} items after exclusions)")
-    print(f"[SUCCESS] Outputs saved to: {OUT_DIR}/")
 
 if __name__ == "__main__":
     import argparse
