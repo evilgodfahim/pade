@@ -3,7 +3,7 @@ name: daily-epaper-extract
 on:
   schedule:
     # 09:00 Asia/Dhaka = 03:00 UTC
-    - cron: '0 1 * * *'
+    - cron: '0 2 * * *'
   workflow_dispatch:
 
 permissions:
