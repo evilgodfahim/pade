@@ -36,7 +36,7 @@ jobs:
       - name: Start FlareSolverr (Direct pull from GHCR)
         run: |
           # Pull and run FlareSolverr in the background
-          docker run -d -p 8191:8191 ghcr.io/flaresolverr/flaresolverr:latest
+          docker run -d -p 8191:8191 ghcr.io/thephaseless/byparr:latest
           # Give it a few seconds to fully boot up
           sleep 10
 
