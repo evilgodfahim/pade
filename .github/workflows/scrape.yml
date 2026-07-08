@@ -43,7 +43,7 @@ jobs:
       - name: Launch FlareSolverr container
         run: |
           docker rm -f flaresolverr 2>/dev/null || true
-          docker run -d --name flaresolverr -p 8191:8191 --restart=no ghcr.io/flaresolverr/flaresolverr:latest
+          docker run -d --name byparr -p 8191:8191 --restart=no ghcr.io/thephaseless/byparr:latest
           echo "waiting for flaresolverr to respond..."
           for i in $(seq 1 18); do
             if curl -sS --max-time 3 "${FLARESOLVERR_URL}" >/dev/null 2>&1; then
