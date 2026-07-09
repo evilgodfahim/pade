@@ -40,19 +40,32 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Launch FlareSolverr container
+      - name: Start Redis
         run: |
-          docker rm -f flaresolverr 2>/dev/null || true
-          docker run -d --name byparr -p 8191:8191 --restart=no ghcr.io/thephaseless/byparr:latest
-          echo "waiting for flaresolverr to respond..."
-          for i in $(seq 1 18); do
-            if curl -sS --max-time 3 "${FLARESOLVERR_URL}" >/dev/null 2>&1; then
-              echo "flaresolverr is up"
-              break
-            fi
-            sleep 5
-          done
+          docker network create trawl-net
+          docker run -d \
+            --name redis \
+            --network trawl-net \
+            redis:alpine
 
+      - name: Start Trawl
+        run: |
+          docker run -d \
+            --name trawl \
+            --network trawl-net \
+            -p 8191:8191 \
+            -e REDIS_URL=redis://redis:6379 \
+            -e BROWSER_POOL_SIZE=2 \
+            -e RESIDENTIAL_PROXY_URL=${{ secrets.WEBSHARE_PROXY_URL }} \
+            ghcr.io/germondai/trawl:latest
+
+      - name: Wait for Trawl
+        run: |
+          for i in $(seq 1 40); do
+            curl -sf http://localhost:8191/health && echo 'Trawl ready' && exit 0
+            sleep 2
+          done
+          docker logs trawl && exit 1
       - name: Run extractor script
         run: |
           set -o pipefail
